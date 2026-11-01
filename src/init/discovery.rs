@@ -132,3 +132,222 @@ pub fn find_real_trackpads() -> Result<Vec<String>, Error> {
         "no multitouch touchpad discoverable",
     ))
 }
+
+/// An opened keyboard, deliberately read-only and never exclusively grabbed.
+/// Remappers may grab the physical keyboard and re-emit through a virtual
+/// one, so bus type and device name are not reliable discovery criteria.
+pub struct Keyboard {
+    pub path: std::path::PathBuf,
+    pub device: EvdevHandle<std::fs::File>,
+}
+
+/// Sysfs prints unsigned-long words most-significant first, omitting
+/// leading zeroes within each word. Keep word boundaries: concatenating
+/// the hex strings would shift bits when an interior word is short.
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn parse(text: &str) -> Option<Self> {
+        let words: Option<Vec<_>> = text
+            .split_whitespace()
+            .rev()
+            .map(|word| {
+                if word.len() > 16 || !word.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                u64::from_str_radix(word, 16).ok()
+            })
+            .collect();
+        let words = words?;
+        if words.is_empty() {
+            return None;
+        }
+        Some(Self(words))
+    }
+
+    fn get(&self, code: u16) -> bool {
+        self.0
+            .get(usize::from(code) / 64)
+            .is_some_and(|word| word & (1u64 << (code % 64)) != 0)
+    }
+}
+
+/// Remappers can combine keyboard and pointer capabilities on one device.
+/// Letters identify typing sources; only absolute (touch/tablet) axes and
+/// our own clone's phys marker disqualify an otherwise valid keyboard.
+/// Touch *key* bits (BTN_TOUCH/BTN_TOOL_FINGER) are deliberately not a
+/// criterion: uinput remappers such as xwaykeyz advertise nearly every
+/// key code, touch buttons included, while having no absolute axes.
+fn is_typing_keyboard(ev: &Bits, key: &Bits, abs: &Bits, phys: &str) -> bool {
+    ev.get(input_linux::EventKind::Key as u16)
+        && [Key::A, Key::Z, Key::Space]
+            .iter()
+            .all(|&code| key.get(code as u16))
+        && ![
+            AbsoluteAxis::X,
+            AbsoluteAxis::MultitouchSlot,
+            AbsoluteAxis::MultitouchPositionX,
+        ]
+        .iter()
+        .any(|&code| abs.get(code as u16))
+        && !phys.starts_with(CLONE_PHYS_MARKER)
+}
+
+fn sysfs_typing_keyboard(device: &std::path::Path) -> Option<bool> {
+    let read_bits =
+        |name| Bits::parse(&std::fs::read_to_string(device.join("capabilities").join(name)).ok()?);
+    let ev = read_bits("ev")?;
+    let key = read_bits("key")?;
+    let abs = read_bits("abs")?;
+    let phys = std::fs::read_to_string(device.join("phys")).ok()?;
+    Some(is_typing_keyboard(&ev, &key, &abs, &phys))
+}
+
+pub fn find_keyboards(
+    monitored: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<Vec<Keyboard>, Error> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/dev/input")?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("event") || monitored.contains(&path) {
+            continue;
+        }
+        // Opening an evdev node can wake/power-cycle its driver. Classify
+        // via sysfs first, so housekeeping never opens unrelated devices.
+        // Missing or malformed metadata is not evidence of a keyboard.
+        let device = std::path::Path::new("/sys/class/input")
+            .join(&name)
+            .join("device");
+        if sysfs_typing_keyboard(&device) != Some(true) {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+        else {
+            continue; // disappearing or unreadable devices must not stop the touchpad
+        };
+        let device = EvdevHandle::new(file);
+        found.push(Keyboard { path, device });
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bits(codes: &[u16]) -> Bits {
+        let mut words = vec![0; 12];
+        for &code in codes {
+            words[usize::from(code) / 64] |= 1u64 << (code % 64);
+        }
+        Bits(words)
+    }
+
+    #[test]
+    fn classifies_typing_sources_including_combined_remapper() {
+        let letters = [Key::A as u16, Key::Z as u16, Key::Space as u16];
+        let key_ev = bits(&[1]);
+        let combined_ev = bits(&[1, 2]); // EV_KEY + EV_REL
+        let no_abs = bits(&[]);
+        assert!(is_typing_keyboard(
+            &key_ev,
+            &bits(&letters),
+            &no_abs,
+            "isa0060/serio0"
+        ));
+        let mut combined_keys = letters.to_vec();
+        combined_keys.push(Key::ButtonLeft as u16);
+        assert!(is_typing_keyboard(
+            &combined_ev,
+            &bits(&combined_keys),
+            &no_abs,
+            "py-evdev-uinput"
+        ));
+        assert!(!is_typing_keyboard(
+            &combined_ev,
+            &bits(&[Key::ButtonLeft as u16]),
+            &no_abs,
+            "mouse"
+        ));
+        assert!(!is_typing_keyboard(
+            &key_ev,
+            &bits(&[Key::VolumeUp as u16]),
+            &no_abs,
+            "consumer"
+        ));
+        assert!(!is_typing_keyboard(
+            &key_ev,
+            &bits(&letters),
+            &no_abs,
+            &format!("{CLONE_PHYS_MARKER}/keyboard")
+        ));
+        assert!(!is_typing_keyboard(
+            &bits(&[2]),
+            &bits(&letters),
+            &no_abs,
+            "no EV_KEY"
+        ));
+
+        // Touch key bits alone don't disqualify: remappers advertise them.
+        let mut touch_keys = letters.to_vec();
+        touch_keys.extend([Key::ButtonToolFinger as u16, Key::ButtonTouch as u16]);
+        assert!(is_typing_keyboard(
+            &key_ev,
+            &bits(&touch_keys),
+            &no_abs,
+            "py-evdev-uinput"
+        ));
+
+        // Each absolute-axis discriminator must reject even a device
+        // advertising letters; test them independently so none masks another.
+        for axis in [
+            AbsoluteAxis::X,
+            AbsoluteAxis::MultitouchSlot,
+            AbsoluteAxis::MultitouchPositionX,
+        ] {
+            assert!(!is_typing_keyboard(
+                &key_ev,
+                &bits(&letters),
+                &bits(&[axis as u16]),
+                "touchpad"
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_real_xwaykeyz_sysfs_bitmaps() {
+        let key = Bits::parse("3f3f3fffffff03ff ffffffff000fffff 700007fffffff 7fe003fffff000f f7ffffffffffffff ffffffff000fe420 1f03ff 1ffffffffffff07 ffffffffffffffff ffffffffffefffff fffffffffffffffe\n").unwrap();
+        for code in [Key::A, Key::Z, Key::Space, Key::ButtonLeft] {
+            assert!(key.get(code as u16));
+        }
+        // The real remapper bitmap advertises touch buttons too (word 5,
+        // ffffffff000fe420, bits 5 and 10) -- which is exactly why touch
+        // key bits can't be a rejection criterion. It has no EV_ABS.
+        assert!(key.get(Key::ButtonToolFinger as u16));
+        assert!(key.get(Key::ButtonTouch as u16));
+        let ev = Bits::parse("200007\n").unwrap();
+        assert!(ev.get(1)); // EV_KEY
+        assert!(ev.get(2)); // EV_REL
+        assert!(!ev.get(3)); // no EV_ABS
+        assert!(is_typing_keyboard(&ev, &key, &bits(&[]), "py-evdev-uinput"));
+    }
+
+    #[test]
+    fn parses_short_words_at_unsigned_long_boundaries() {
+        let bitmap = Bits::parse("1 2 3").unwrap();
+        for code in [0, 1, 65, 128] {
+            assert!(bitmap.get(code));
+        }
+        for code in [2, 64, 127, 129, 192] {
+            assert!(!bitmap.get(code));
+        }
+        assert!(!Bits::parse("0").unwrap().get(0));
+        for invalid in ["", " ", "xyz", "1 invalid", "10000000000000000", "+1"] {
+            assert!(Bits::parse(invalid).is_none());
+        }
+    }
+}

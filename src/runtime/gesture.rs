@@ -113,6 +113,8 @@ pub struct Timing {
     /// faster the hand comes down) can abort the misclassified drag
     /// without a phantom click ever having been sent.
     pub press_grace: Duration,
+    /// Refuse new drags near typing; zero preserves the original classification.
+    pub typing_timeout: Duration,
     /// Combined px-per-mm * user acceleration factor.
     pub px_per_mm: f64,
 }
@@ -176,6 +178,11 @@ pub struct GestureMachine {
     touch_start: Option<Instant>,
     touch_max: usize,
     settled: bool,
+    /// Latched for the whole touch: a resting palm must not become a drag
+    /// just because typing stops while the fingers are still down.
+    drag_blocked: bool,
+    typing_refusal_logged: bool,
+    last_key_press: Option<Instant>,
 
     /// Virtual left button state (survives across touches for drag-lock).
     held: bool,
@@ -205,6 +212,9 @@ impl GestureMachine {
             touch_start: None,
             touch_max: 0,
             settled: false,
+            drag_blocked: false,
+            typing_refusal_logged: false,
+            last_key_press: None,
             held: false,
             lock_deadline: None,
         }
@@ -213,7 +223,19 @@ impl GestureMachine {
     /// Hot-reload hook: swap in new timing/scaling without disturbing
     /// any in-flight touch state.
     pub fn set_timing(&mut self, timing: Timing) {
+        if self.timing.typing_timeout != timing.typing_timeout {
+            self.last_key_press = None;
+        }
         self.timing = timing;
+    }
+
+    /// Record a qualifying keyboard press/repeat. Filtering belongs to the
+    /// I/O shell; this clock-injected hook never sees or stores key codes.
+    /// A committed drag keeps owning its touch even when typing resumes.
+    pub fn note_key_press(&mut self, now: Instant) {
+        if !self.timing.typing_timeout.is_zero() {
+            self.last_key_press = Some(now);
+        }
     }
 
     /// Whether the virtual button is currently held (used by the shell
@@ -352,6 +374,8 @@ impl GestureMachine {
             self.pending.clear();
             self.touch_start = None;
             self.touch_max = 0;
+            self.drag_blocked = false;
+            self.typing_refusal_logged = false;
         } else {
             // The synthetic device (or the buffer of a still-undecided
             // touch) may hold stale state. Correct it explicitly: release
@@ -422,6 +446,8 @@ impl GestureMachine {
                 self.touch_start = None;
                 self.touch_max = 0;
                 self.settled = false;
+                self.drag_blocked = false;
+                self.typing_refusal_logged = false;
                 // A committed drag that never moved and lifted before
                 // the press grace still owes its click: press now so the
                 // release below (or the drag-lock) completes it.
@@ -487,6 +513,8 @@ impl GestureMachine {
             self.touch_start = None;
             self.touch_max = 0;
             self.settled = false;
+            self.drag_blocked = false;
+            self.typing_refusal_logged = false;
             if had_pending {
                 // Touch ended before a decision was reached (e.g. a
                 // quick tap): flush everything buffered, including this
@@ -507,6 +535,12 @@ impl GestureMachine {
             self.touch_max = count;
             self.settled = false;
             self.pending.clear();
+            // Remember typing at touchdown even if the entry window (or
+            // late growth from 1-2 fingers) outlasts the timeout. Checking
+            // only at commit would lose this evidence.
+            self.drag_blocked = false;
+            self.typing_refusal_logged = false;
+            self.block_drag_for_typing(now);
         } else {
             self.touch_max = self.touch_max.max(count);
         }
@@ -522,7 +556,7 @@ impl GestureMachine {
             // happens at the tail of every 4-finger swipe because
             // fingers never lift in unison -- from being hijacked into
             // a phantom drag + click.
-            if count == 3 && self.touch_max == 3 {
+            if count == 3 && self.touch_max == 3 && !self.refuse_drag_for_typing(now) {
                 self.commit_drag(&active, now, out);
                 return;
             }
@@ -562,7 +596,7 @@ impl GestureMachine {
     /// touch held stably at exactly 3 fingers the whole time, otherwise
     /// release it to the compositor as an ordinary gesture.
     fn resolve_touch_decision(&mut self, count: usize, now: Instant, out: &mut Vec<Output>) {
-        if count == 3 && self.touch_max == 3 {
+        if count == 3 && self.touch_max == 3 && !self.refuse_drag_for_typing(now) {
             self.pending.clear();
             let active = self.active_slots();
             self.commit_drag(&active, now, out);
@@ -570,6 +604,30 @@ impl GestureMachine {
         }
         self.settled = true;
         self.flush_pending(out);
+    }
+
+    fn block_drag_for_typing(&mut self, now: Instant) -> bool {
+        if !self.drag_blocked
+            && !self.timing.typing_timeout.is_zero()
+            && self
+                .last_key_press
+                .is_some_and(|key| now.saturating_duration_since(key) <= self.timing.typing_timeout)
+        {
+            self.drag_blocked = true;
+        }
+        self.drag_blocked
+    }
+
+    /// Called only when a three-finger touch would otherwise commit.
+    /// Touchdown latches silently; repeated frames of a refused touch
+    /// must not flood the log, even after the typing window expires.
+    fn refuse_drag_for_typing(&mut self, now: Instant) -> bool {
+        let blocked = self.block_drag_for_typing(now);
+        if blocked && !self.typing_refusal_logged {
+            debug!("Touch refused as a drag due to typing; blocked until all fingers lift");
+            self.typing_refusal_logged = true;
+        }
+        blocked
     }
 
     /// Commit the current touch as a 3-finger drag. The button press is
