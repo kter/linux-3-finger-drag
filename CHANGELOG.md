@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Opt-in `typingTimeout` (milliseconds, default `0`, maximum `2000`) prevents
+  new or resumed 3-finger drags near non-modifier typing, including touches
+  that grow late from 1-2 fingers. Refused touches are relayed until lift;
+  active drags and modifier-assisted drags are unaffected. Read-only keyboard
+  monitoring supports remapper virtual keyboards, periodic rediscovery and
+  hot reload, without logging key codes.
+
 ## 2.0.0 - 2026-07-06
 
 Architecture rewrite: the program is now an evdev multitouch proxy

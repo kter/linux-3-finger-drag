@@ -83,11 +83,21 @@ linux-3-finger-drag [--device /dev/input/eventN]
 |---|---|---|
 | `acceleration` | `1.0` | drag speed multiplier (`> 1` faster, `< 1` slower) |
 | `dragEndDelay` | `0` | drag-lock, in ms: after lifting, the button stays held this long, and a new 3-finger touch inside the window **continues the same drag**. Any other touch releases the button *before* it is relayed, so post-drag pointer motion can never smear the held button around. `0` disables. |
+| `typingTimeout` | `0` | Disable starting/resuming a drag within this many milliseconds of a non-modifier key press or autorepeat (checked at touch start and at the drag decision, including late growth to 3 fingers). `0` disables; clamped to 2000 ms. A refused touch stays ordinary until all fingers lift; active drags are unaffected. |
 | `entryDebounce` | `50` | length of time (in milliseconds) an ambiguous (2-3 finger, possibly still growing) fresh touch is withheld before committing: drag, or replay to the compositor |
 | `probeDelay` | `15` | Length of time (in milliseconds) a so-far-lone finger is withheld (just long enough to catch a 2nd/3rd finger landing a beat behind the 1st) |
 | `pressGrace` | `75` | Length of time (in milliseconds) a committed drag defers its button press while the fingers haven't moved. Lets a 4th finger that lands *after* the entry window (fast, sloppy 4-finger swipes stagger hard) abort the misclassified drag with no phantom click — the touch is handed to the compositor mid-gesture instead |
 | `logFile` | `"stdout"` | log destination (`"stdout"` or a file path). It works best with absolute paths, because `~` or other shell variables are not expanded, but relative filepaths work. Will create the file if it does not exist. |
 | `logLevel` | `"info"` | One of the following values: `off` / `error` / `warn` / `info` / `debug` / `trace`. For more info on what these levels are intended to capture, see the documentation for [the `enum` to which these values correspond](https://docs.rs/log/0.4.6/log/enum.Level.html). Note that `debug` and `trace` levels generate logs extremely rapidly, which both baloons the log file size (even after short periods of use), and consumes spikes CPU usage on fast, long gestures. |
+
+
+For example, set `"typingTimeout": 300` to prevent accidental drags while typing.
+Refused touches are relayed to the compositor for libinput's own palm and
+disable-while-typing handling. Shift, Ctrl, Alt, Meta (both sides) and CapsLock
+are ignored, so modifier-assisted drags still work. When enabled, keyboards
+(including remapper virtual keyboards) are monitored read-only, without grabbing;
+the device list is refreshed every 2 seconds to handle remapper restarts.
+Enabling/disabling this setting is hot-reloaded. Key codes are never logged.
 
 
 ## Testing

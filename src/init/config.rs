@@ -103,6 +103,13 @@ pub struct Configuration {
     #[serde(default = "default_75ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub press_grace: Duration, // in milliseconds
+
+    // The virtual mouse bypasses libinput's disable-while-typing. Guard
+    // drag commits ourselves, including a live 1-2 finger touch growing
+    // late to 3. Opt-in so existing users retain their current behavior.
+    #[serde(default = "default_0ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    pub typing_timeout: Duration, // in milliseconds
 }
 
 impl Configuration {
@@ -114,6 +121,7 @@ impl Configuration {
             entry_debounce: self.entry_debounce,
             drag_end_delay: self.drag_end_delay,
             press_grace: self.press_grace,
+            typing_timeout: self.typing_timeout,
             px_per_mm: PX_PER_MM * self.acceleration,
         }
     }
@@ -129,6 +137,7 @@ impl Default for Configuration {
             entry_debounce: Duration::from_millis(50),
             probe_delay: Duration::from_millis(15),
             press_grace: Duration::from_millis(75),
+            typing_timeout: default_0ms(),
         }
     }
 }
@@ -269,6 +278,14 @@ impl Configuration {
             );
             self.press_grace = Duration::from_millis(1000);
         }
+        if self.typing_timeout > Duration::from_millis(2000) {
+            fix(
+                "typingTimeout",
+                format!("{:?}", self.typing_timeout),
+                "2000ms".into(),
+            );
+            self.typing_timeout = Duration::from_millis(2000);
+        }
         if self.drag_end_delay > Duration::from_millis(5000) {
             fix(
                 "dragEndDelay",
@@ -344,5 +361,34 @@ pub fn init_file_logger(
             println!("[PRE-LOG: WARN]: Logging to stdout at {log_level}-level verbosity.");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typing_timeout_is_optional_and_defaults_to_disabled() {
+        let cfg: Configuration = from_str("{}").unwrap();
+        assert_eq!(cfg.typing_timeout, Duration::ZERO);
+        assert_eq!(
+            Configuration::default().timing().typing_timeout,
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn typing_timeout_deserializes_milliseconds_and_clamps() {
+        let cfg: Configuration = from_str(r#"{"typingTimeout":350}"#).unwrap();
+        assert_eq!(
+            cfg.sanitize().timing().typing_timeout,
+            Duration::from_millis(350)
+        );
+        let cfg: Configuration = from_str(r#"{"typingTimeout":99999}"#).unwrap();
+        assert_eq!(
+            cfg.sanitize().timing().typing_timeout,
+            Duration::from_millis(2000)
+        );
     }
 }

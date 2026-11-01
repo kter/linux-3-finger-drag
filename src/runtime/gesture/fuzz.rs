@@ -189,6 +189,10 @@ impl Hand {
 }
 
 fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
+    run_scenario_with_typing(seed, drag_end_delay_ms, 0);
+}
+
+fn run_scenario_with_typing(seed: u64, drag_end_delay_ms: u64, typing_timeout_ms: u64) {
     let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     let mut m = GestureMachine::new(
         Timing {
@@ -196,6 +200,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
             entry_debounce: Duration::from_millis(50),
             drag_end_delay: Duration::from_millis(drag_end_delay_ms),
             press_grace: Duration::from_millis(75),
+            typing_timeout: Duration::from_millis(typing_timeout_ms),
             px_per_mm: PX_PER_MM,
         },
         10.0,
@@ -247,6 +252,9 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
             }
         }
         now += Duration::from_millis(dt);
+        if typing_timeout_ms > 0 && rng.below(7) == 0 {
+            m.note_key_press(now);
+        }
         let outs = m.on_tick(now);
         apply(&outs, &mut shadow, &mut expect_held, "tick2");
 
@@ -348,5 +356,13 @@ fn randomized_stress_invariants() {
     for seed in 0..48u64 {
         run_scenario(seed, 0);
         run_scenario(seed, 300);
+    }
+}
+
+#[test]
+fn randomized_stress_invariants_with_typing() {
+    for seed in 0..48u64 {
+        run_scenario_with_typing(seed, 0, 200);
+        run_scenario_with_typing(seed, 300, 200);
     }
 }

@@ -13,6 +13,7 @@ fn timing(drag_end_delay_ms: u64) -> Timing {
         entry_debounce: Duration::from_millis(50),
         drag_end_delay: Duration::from_millis(drag_end_delay_ms),
         press_grace: Duration::from_millis(75),
+        typing_timeout: Duration::ZERO,
         px_per_mm: PX_PER_MM,
     }
 }
@@ -844,4 +845,267 @@ fn button_held_tracks_drag_state() {
     assert!(sim.m.button_held());
     sim.frame_at(30, &cat(&[&up(0), &up(1), &up(2)]));
     assert!(!sim.m.button_held());
+}
+
+// =========================================================================
+// disable while typing: both entry-window and late-growth commits
+// =========================================================================
+
+fn typing_sim() -> Sim {
+    let mut sim = Sim::new();
+    let mut t = timing(0);
+    t.typing_timeout = Duration::from_millis(200);
+    sim.m.set_timing(t);
+    sim
+}
+
+fn three_down() -> Vec<Ev> {
+    cat(&[
+        &down(0, 100, 500, 500),
+        &down(1, 101, 600, 500),
+        &down(2, 102, 700, 500),
+    ])
+}
+
+fn all_up() -> Vec<Ev> {
+    cat(&[&up(0), &up(1), &up(2)])
+}
+
+fn assert_relayed(outs: &[Output], events: &[Ev]) {
+    let mut expected = events.to_vec();
+    expected.push(Ev::syn());
+    assert_eq!(synth_events(outs), expected);
+    assert_eq!(mouse_downs(outs), 0);
+    assert_eq!(total_move(outs), (0, 0));
+}
+
+/// The observed failure: a touch was already live for hundreds of ms
+/// before the third finger arrived. Entry debounce cannot protect this.
+#[test]
+fn typing_blocks_late_growth_and_relays_the_third_finger() {
+    let mut sim = typing_sim();
+    sim.frame(&down(0, 100, 500, 500));
+    sim.tick(20);
+    assert_relayed(&sim.frame(&down(1, 101, 600, 500)), &down(1, 101, 600, 500));
+    sim.tick(2000);
+    sim.m.note_key_press(sim.now);
+    let third = down(2, 102, 700, 500);
+    assert_relayed(&sim.frame_at(100, &third), &third);
+    assert!(!sim.m.suppressing);
+    // A refusal is permanent for this touch, even after typing stops.
+    sim.tick(500);
+    let motion = mv(0, 550, 500);
+    assert_relayed(&sim.frame(&motion), &motion);
+    sim.frame(&all_up());
+    assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+}
+
+#[test]
+fn typing_before_touch_blocks_entry_window_and_flushes_buffer() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.tick(100);
+    let touch = three_down();
+    assert!(sim.frame(&touch).is_empty());
+    assert_relayed(&sim.tick(50), &touch);
+    assert!(!sim.m.suppressing);
+}
+
+#[test]
+fn typing_during_entry_window_blocks_at_decision() {
+    let mut sim = typing_sim();
+    let touch = three_down();
+    sim.frame(&touch);
+    sim.tick(25);
+    sim.m.note_key_press(sim.now);
+    assert_relayed(&sim.tick(25), &touch);
+    assert!(!sim.m.suppressing);
+}
+
+/// Typing at touchdown remains relevant even after it falls outside the
+/// commit-time window. The last timestamp alone cannot reconstruct that.
+#[test]
+fn typing_at_touch_start_remains_blocked_after_timeout() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.tick(190);
+    let touch = three_down();
+    sim.frame(&touch);
+    assert_relayed(&sim.tick(50), &touch);
+    sim.tick(500);
+    assert_relayed(&sim.frame(&mv(0, 550, 500)), &mv(0, 550, 500));
+    sim.frame(&all_up());
+    assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+}
+
+#[test]
+fn zero_typing_timeout_ignores_keyboard_activity() {
+    let mut sim = Sim::new();
+    sim.m.note_key_press(sim.now);
+    assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+    assert!(sim.m.suppressing);
+}
+
+#[test]
+fn typing_during_committed_drag_preserves_press_and_motion() {
+    let mut sim = typing_sim();
+    assert_eq!(mouse_downs(&commit_drag_only(&mut sim)), 0);
+    sim.m.note_key_press(sim.now);
+    assert_eq!(mouse_downs(&sim.tick(80)), 1);
+    sim.m.note_key_press(sim.now);
+    let outs = sim.frame(&mv(0, 550, 500));
+    assert_ne!(total_move(&outs), (0, 0));
+    assert_eq!(mouse_ups(&outs), 0);
+    assert!(synth_events(&outs).is_empty());
+    assert_eq!(mouse_ups(&sim.frame(&all_up())), 1);
+}
+
+#[test]
+fn typing_refuses_drag_lock_resume_and_releases_before_relay() {
+    let mut sim = typing_sim();
+    let mut t = timing(1000);
+    t.typing_timeout = Duration::from_millis(200);
+    sim.m.set_timing(t);
+    start_drag(&mut sim);
+    sim.frame(&all_up());
+    assert!(sim.m.button_held());
+    sim.m.note_key_press(sim.now);
+    let touch = three_down();
+    sim.frame(&touch);
+    let outs = sim.tick(50);
+    assert_eq!(outs.first(), Some(&Output::MouseUp));
+    assert_relayed(&outs, &touch);
+    assert!(!sim.m.button_held());
+}
+
+#[test]
+fn typing_buffered_touch_is_swallowed_when_resync_reports_no_fingers() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.frame(&three_down());
+    // The buffered touch ended entirely within a dropped-event window.
+    assert!(sim.m.drag_blocked);
+    assert!(!sim.m.pending.is_empty());
+    let outs = sim.m.on_resync(&[], sim.now);
+    assert!(
+        outs.is_empty(),
+        "do not relay touchdowns with lost releases"
+    );
+    assert!(sim.m.pending.is_empty());
+    assert!(sim.m.touch_start.is_none());
+    assert!(!sim.m.drag_blocked);
+    sim.tick(201);
+    assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+}
+
+#[test]
+fn typing_timeout_hot_reload_affects_new_commit_decisions() {
+    let mut sim = Sim::new();
+    sim.frame(&three_down());
+    let mut t = timing(0);
+    t.typing_timeout = Duration::from_millis(200);
+    sim.m.set_timing(t);
+    sim.m.note_key_press(sim.now);
+    assert_relayed(&sim.tick(50), &three_down());
+    sim.frame(&all_up());
+    sim.m.set_timing(timing(0));
+    sim.m.note_key_press(sim.now);
+    assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+}
+
+#[test]
+fn typing_guard_applies_to_frame_driven_entry_decision_too() {
+    let mut sim = typing_sim();
+    let touch = three_down();
+    sim.frame(&touch);
+    sim.m.note_key_press(sim.now);
+    let motion = mv(0, 550, 500);
+    let outs = sim.frame_at(50, &motion);
+    let mut expected = touch;
+    expected.push(Ev::syn());
+    expected.extend(motion);
+    expected.push(Ev::syn());
+    assert_eq!(synth_events(&outs), expected);
+    assert!(!sim.m.suppressing);
+}
+
+#[test]
+fn changing_typing_timeout_discards_previous_key_press() {
+    for timeout in [0, 300] {
+        let mut sim = typing_sim();
+        sim.m.note_key_press(sim.now);
+        let mut t = timing(0);
+        t.typing_timeout = Duration::from_millis(timeout);
+        sim.m.set_timing(t);
+        t.typing_timeout = Duration::from_millis(200);
+        sim.m.set_timing(t);
+        assert_eq!(mouse_downs(&start_drag(&mut sim)), 1);
+    }
+}
+
+#[test]
+fn key_press_just_outside_timeout_allows_entry_window_drag() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.tick(201);
+    sim.frame(&three_down());
+    assert!(sim.tick(50).is_empty());
+    assert!(sim.m.suppressing);
+    assert_eq!(mouse_downs(&sim.tick(80)), 1);
+}
+
+#[test]
+fn key_press_just_outside_timeout_allows_late_growth_drag() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.tick(201);
+    sim.frame(&down(0, 100, 500, 500));
+    sim.tick(20);
+    sim.frame(&down(1, 101, 600, 500));
+    sim.frame(&down(2, 102, 700, 500));
+    assert!(sim.m.suppressing);
+    assert_eq!(mouse_downs(&sim.tick(80)), 1);
+}
+
+#[test]
+fn typing_refusal_is_silent_until_three_fingers_and_logged_once_per_touch() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.frame(&down(0, 100, 500, 500));
+    assert!(sim.m.drag_blocked);
+    assert!(!sim.m.typing_refusal_logged);
+    sim.tick(20);
+    assert!(!sim.m.typing_refusal_logged);
+    sim.frame(&down(1, 101, 600, 500));
+    assert!(!sim.m.typing_refusal_logged);
+    sim.frame(&down(2, 102, 700, 500));
+    assert!(sim.m.typing_refusal_logged);
+    sim.tick(201);
+    sim.frame(&mv(0, 550, 500));
+    assert!(sim.m.typing_refusal_logged);
+    assert!(!sim.m.suppressing);
+    sim.frame(&all_up());
+    assert!(!sim.m.typing_refusal_logged);
+}
+
+#[test]
+fn entry_window_typing_refusal_records_log_only_at_decision() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    sim.frame(&three_down());
+    assert!(!sim.m.typing_refusal_logged);
+    sim.tick(50);
+    assert!(sim.m.typing_refusal_logged);
+}
+
+#[test]
+fn unchanged_typing_timeout_preserves_recent_key_press() {
+    let mut sim = typing_sim();
+    sim.m.note_key_press(sim.now);
+    let mut t = timing(0);
+    t.typing_timeout = Duration::from_millis(200);
+    t.px_per_mm = 15.0;
+    sim.m.set_timing(t);
+    sim.frame(&three_down());
+    assert_relayed(&sim.tick(50), &three_down());
 }

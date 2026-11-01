@@ -10,7 +10,9 @@ use tracing_subscriber::fmt::time::ChronoLocal;
 
 use linux_3_finger_drag::{
     init::{config, discovery},
-    runtime::{gesture::GestureMachine, mt_proxy::MtProxy, virtual_trackpad},
+    runtime::{
+        gesture::GestureMachine, keyboard::KeyboardMonitor, mt_proxy::MtProxy, virtual_trackpad,
+    },
 };
 
 /// How often the config file's mtime is checked for hot reload.
@@ -157,15 +159,18 @@ async fn run(
         );
         let watch = AsyncFd::with_interest(FdWatch(proxy.as_raw_fd()), Interest::READABLE)?;
 
+        let mut keyboards = KeyboardMonitor::default();
+        keyboards.refresh(!cfg.typing_timeout.is_zero());
+
         info!("linux-3-finger-drag started successfully!");
 
-        // Inner loop: fully event-driven. We wake for exactly three
-        // reasons: the touchpad has events, a gesture decision deadline
-        // arrived, or housekeeping (config reload / shutdown signal).
+        // Inner loop: fully event-driven. Keyboard readiness participates
+        // alongside touch frames, exact gesture deadlines and housekeeping.
         let lost_device = loop {
             tokio::select! {
                 ready = watch.readable() => {
                     let mut guard = ready?;
+                    keyboards.drain(&mut machine);
                     match proxy.drain(&mut machine, vtp) {
                         Ok(()) => { guard.clear_ready(); }
                         Err(e) if is_unplug(&e) => break true,
@@ -173,7 +178,12 @@ async fn run(
                     }
                 }
 
+                _ = keyboards.ready() => {
+                    keyboards.drain(&mut machine);
+                }
+
                 _ = sleep_until_opt(machine.next_deadline()) => {
+                    keyboards.drain(&mut machine);
                     let outs = machine.on_tick(std::time::Instant::now());
                     proxy.apply(&outs, vtp)?;
                 }
@@ -188,6 +198,10 @@ async fn run(
                         machine.set_timing(cfg.timing());
                         info!("Configuration reloaded (log settings need a restart).");
                     }
+                    // Drain dead readers before discovery: a restarted remapper
+                    // can recreate a keyboard at the very same event path.
+                    keyboards.drain(&mut machine);
+                    keyboards.refresh(!cfg.typing_timeout.is_zero());
                 }
 
                 _ = sigterm.recv() => break false,
